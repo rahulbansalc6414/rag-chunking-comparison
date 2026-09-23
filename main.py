@@ -2,22 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from sentence_transformers import SentenceTransformer
 
 from config import Config
 from data_loader import load_dataset_sample, DATASET_REGISTRY
 from chunkers import get_all_strategies, chunk_documents
 from vector_store import VectorStore
-from evaluator import full_report, StrategyReport
+from evaluator import (
+    full_report, get_embedding_helper, LLMJudge,
+    save_detailed_results, StrategyReport,
+)
 
 
 console = Console()
@@ -33,7 +33,18 @@ def parse_args() -> Config:
     parser.add_argument("--chunk-overlap", type=int, default=50)
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--num-contexts", type=int, default=100)
+    parser.add_argument("--max-queries", type=int, default=50, help="Max queries to run (0 = all)")
+    parser.add_argument("--difficult-only", action="store_true", help="Only use hard questions (QuALITY only)")
     parser.add_argument("--embedding-model", type=str, default="all-MiniLM-L6-v2")
+    parser.add_argument(
+        "--embedding-provider", type=str, default="local", choices=["local", "openrouter"],
+        help="Use 'local' for Sentence Transformers or 'openrouter' for API-based embeddings",
+    )
+    parser.add_argument("--openrouter-api-key", type=str, default="")
+    parser.add_argument(
+        "--llm-judge", type=str, default="",
+        help="OpenRouter model for LLM-as-judge evaluation (e.g. anthropic/claude-sonnet-4)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -43,7 +54,12 @@ def parse_args() -> Config:
         chunk_overlap=args.chunk_overlap,
         top_k=args.top_k,
         num_contexts=args.num_contexts,
+        max_queries=args.max_queries,
+        difficult_only=args.difficult_only,
         embedding_model_name=args.embedding_model,
+        embedding_provider=args.embedding_provider,
+        openrouter_api_key=args.openrouter_api_key,
+        llm_judge=args.llm_judge,
         random_seed=args.seed,
     )
 
@@ -68,9 +84,10 @@ def print_stats_table(reports: list[StrategyReport]) -> None:
     console.print(table)
 
 
-def print_hit_rate_table(reports: list[StrategyReport], dataset: str) -> None:
-    is_mc = dataset == "quality"
-    if is_mc:
+def print_hit_rate_table(reports: list[StrategyReport], config: Config) -> None:
+    if config.llm_judge:
+        title = f"LLM Judge Accuracy ({config.llm_judge})"
+    elif config.dataset == "quality":
         title = "Answer Accuracy (retrieved chunks help pick the correct option)"
     else:
         title = "Answer Hit Rate (top-k retrieval contains the answer)"
@@ -109,13 +126,9 @@ def print_sample_chunks(chunks_by_strategy: dict[str, list]) -> None:
             console.print(f"  [dim]Chunk {c.index}[/dim] ({len(c.text)} chars): {snippet}")
 
 
-def save_results(config: Config, reports: list[StrategyReport]) -> Path:
-    results_dir = Path("results")
-    results_dir.mkdir(exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{config.dataset}_{timestamp}.json"
-    filepath = results_dir / filename
+def save_results(config: Config, reports: list[StrategyReport], run_dir: Path) -> Path:
+    filename = "summary.json"
+    filepath = run_dir / filename
 
     result = {
         "timestamp": datetime.now().isoformat(),
@@ -125,7 +138,10 @@ def save_results(config: Config, reports: list[StrategyReport]) -> Path:
             "chunk_overlap": config.chunk_overlap,
             "top_k": config.top_k,
             "num_contexts": config.num_contexts,
+            "max_queries": config.max_queries,
             "embedding_model": config.embedding_model_name,
+            "embedding_provider": config.embedding_provider,
+            "llm_judge": config.llm_judge,
             "semantic_breakpoint_type": config.semantic_breakpoint_type,
             "random_seed": config.random_seed,
         },
@@ -153,47 +169,40 @@ def save_results(config: Config, reports: list[StrategyReport]) -> Path:
     return filepath
 
 
-def save_chart(reports: list[StrategyReport], dataset: str, path: str = "comparison_chart.png") -> None:
-    strategies = [r.strategy for r in reports]
-    counts = [r.chunk_stats.count for r in reports]
-    avg_sizes = [r.chunk_stats.avg_size for r in reports]
-    hit_rates = [r.hit_rate for r in reports]
-
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
-    colors = ["#4C72B0", "#55A868", "#C44E52"]
-
-    axes[0].bar(strategies, counts, color=colors)
-    axes[0].set_title("Chunk Count")
-    axes[0].set_ylabel("Number of Chunks")
-
-    axes[1].bar(strategies, avg_sizes, color=colors)
-    axes[1].set_title("Avg Chunk Size (chars)")
-    axes[1].set_ylabel("Characters")
-
-    axes[2].bar(strategies, hit_rates, color=colors)
-    axes[2].set_title("Answer Hit Rate")
-    axes[2].set_ylabel("Hit Rate (%)")
-    axes[2].set_ylim(0, 100)
-
-    plt.suptitle(f"RAG Chunking Strategy Comparison ({dataset})", fontsize=14, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(path, dpi=150)
-    console.print(f"\nChart saved to [bold]{path}[/bold]")
-
-
 def main():
     config = parse_args()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = Path("results") / f"{config.dataset}_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
     console.print(Panel(f"[bold]RAG Chunking Strategy Comparison — {config.dataset}[/bold]", style="blue"))
 
     console.print(f"\n[bold]Loading {config.dataset} dataset...[/bold]")
     documents, qa_pairs = load_dataset_sample(config)
     console.print(f"Loaded {len(documents)} documents, {len(qa_pairs)} QA pairs")
 
+    if config.difficult_only:
+        qa_pairs = [qa for qa in qa_pairs if qa.difficult]
+        console.print(f"Filtered to {len(qa_pairs)} hard questions (--difficult-only)")
+
+    if config.max_queries > 0 and len(qa_pairs) > config.max_queries:
+        qa_pairs = qa_pairs[:config.max_queries]
+        console.print(f"Capped to {config.max_queries} queries (--max-queries)")
+
+    llm_judge = None
+    if config.llm_judge:
+        api_key = config.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        if not api_key:
+            console.print("[bold red]Error: --llm-judge requires OPENROUTER_API_KEY[/bold red]")
+            return
+        llm_judge = LLMJudge(config.llm_judge, api_key)
+        console.print(f"[bold]LLM judge enabled: {config.llm_judge}[/bold]")
+
     is_mc = any(qa.is_multiple_choice for qa in qa_pairs)
-    mc_model = None
-    if is_mc:
+    embedding_helper = None
+    if is_mc and not llm_judge:
         console.print("[bold]Multiple-choice dataset detected — loading evaluation model...[/bold]")
-        mc_model = SentenceTransformer(config.embedding_model_name)
+        embedding_helper = get_embedding_helper(config)
 
     store = VectorStore(config)
     strategies = get_all_strategies(config)
@@ -215,21 +224,25 @@ def main():
 
         console.print("  Evaluating retrieval...")
         report = full_report(
-            name, chunks, elapsed, store, collection, qa_pairs, config.top_k, mc_model
+            name, chunks, elapsed, store, collection, qa_pairs, config.top_k,
+            embedding_helper, llm_judge,
         )
         reports.append(report)
         console.print(f"  Hit rate: {report.hit_rate:.1f}%")
 
+        if llm_judge:
+            detail_path = save_detailed_results(name, report.retrieval_results, run_dir)
+            console.print(f"  Detail CSV: [bold]{detail_path}[/bold]")
+
     console.print("\n")
     print_stats_table(reports)
     console.print()
-    print_hit_rate_table(reports, config.dataset)
+    print_hit_rate_table(reports, config)
     console.print()
     print_sample_chunks(chunks_by_strategy)
-    save_chart(reports, config.dataset)
 
-    results_path = save_results(config, reports)
-    console.print(f"Results saved to [bold]{results_path}[/bold]")
+    results_path = save_results(config, reports, run_dir)
+    console.print(f"\nResults saved to [bold]{run_dir}/[/bold]")
 
 
 if __name__ == "__main__":

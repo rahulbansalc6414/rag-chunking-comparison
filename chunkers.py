@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 
@@ -59,7 +60,16 @@ class SemanticChunkerWrapper(ChunkerBase):
     name = "Semantic"
 
     def __init__(self, config: Config):
-        embeddings = HuggingFaceEmbeddings(model_name=config.embedding_model_name)
+        if config.is_api_embedding:
+            from langchain_openai import OpenAIEmbeddings
+            api_key = config.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
+            embeddings = OpenAIEmbeddings(
+                model=config.embedding_model_name,
+                openai_api_key=api_key,
+                openai_api_base="https://openrouter.ai/api/v1",
+            )
+        else:
+            embeddings = HuggingFaceEmbeddings(model_name=config.embedding_model_name)
         self.splitter = SemanticChunker(
             embeddings=embeddings,
             breakpoint_threshold_type=config.semantic_breakpoint_type,

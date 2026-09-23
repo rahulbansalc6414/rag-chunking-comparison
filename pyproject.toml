@@ -11,9 +11,10 @@ dependencies = [
     "langchain-community>=0.4.2",
     "langchain-experimental>=0.4.2",
     "langchain-huggingface>=1.2.2",
+    "langchain-openai>=1.6.2",
     "langchain-text-splitters>=1.1.2",
-    "matplotlib>=3.11.2",
     "numpy>=2.5.3",
+    "openai>=3.16.2",
     "rich>=15.0.0",
     "sentence-transformers>=6.1.0",
 ]

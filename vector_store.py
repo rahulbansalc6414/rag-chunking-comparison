@@ -3,17 +3,17 @@ from __future__ import annotations
 import shutil
 
 import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 from chunkers import Chunk
 from config import Config
+from embeddings import get_chroma_embedding_function
 
 
 class VectorStore:
     def __init__(self, config: Config):
         self.config = config
         self.client = chromadb.PersistentClient(path=str(config.chroma_persist_dir))
-        self.ef = SentenceTransformerEmbeddingFunction(model_name=config.embedding_model_name)
+        self.ef = get_chroma_embedding_function(config)
 
     def create_collection(self, strategy_name: str) -> chromadb.Collection:
         name = f"{strategy_name.lower()}_chunks"

@@ -17,6 +17,7 @@ class QAPair:
     context_id: str
     options: list[str] = field(default_factory=list)
     gold_label: int | None = None
+    difficult: bool = False
 
     @property
     def is_multiple_choice(self) -> bool:
@@ -94,6 +95,7 @@ class QuALITYLoader(DatasetLoader):
                     context_id=aid,
                     options=row["options"],
                     gold_label=gold_idx,
+                    difficult=bool(row.get("difficult", 0)),
                 )
             )
 
