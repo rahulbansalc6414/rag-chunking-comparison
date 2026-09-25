@@ -15,6 +15,7 @@ dependencies = [
     "langchain-text-splitters>=1.1.2",
     "numpy>=2.5.3",
     "openai>=3.16.2",
+    "rank-bm25>=0.2.2",
     "rich>=15.0.0",
     "sentence-transformers>=6.1.0",
 ]

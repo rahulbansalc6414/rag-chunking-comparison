@@ -18,34 +18,41 @@ from evaluator import (
     full_report, get_embedding_helper, LLMJudge,
     save_detailed_results, StrategyReport,
 )
+from retriever import DenseRetriever, HybridRetriever
 
 
 console = Console()
 
 
 def parse_args() -> Config:
+    d = Config()
     parser = argparse.ArgumentParser(description="RAG Chunking Strategy Comparison")
     parser.add_argument(
-        "--dataset", type=str, default="squad",
+        "--dataset", type=str, default=d.dataset,
         help=f"Dataset to use ({', '.join(sorted(DATASET_REGISTRY.keys()))})",
     )
-    parser.add_argument("--chunk-size", type=int, default=500)
-    parser.add_argument("--chunk-overlap", type=int, default=50)
-    parser.add_argument("--top-k", type=int, default=3)
-    parser.add_argument("--num-contexts", type=int, default=100)
-    parser.add_argument("--max-queries", type=int, default=50, help="Max queries to run (0 = all)")
-    parser.add_argument("--difficult-only", action="store_true", help="Only use hard questions (QuALITY only)")
-    parser.add_argument("--embedding-model", type=str, default="all-MiniLM-L6-v2")
+    parser.add_argument("--chunk-size", type=int, default=d.chunk_size)
+    parser.add_argument("--chunk-overlap", type=int, default=d.chunk_overlap)
+    parser.add_argument("--top-k", type=int, default=d.top_k)
+    parser.add_argument("--num-contexts", type=int, default=d.num_contexts)
+    parser.add_argument("--max-queries", type=int, default=d.max_queries, help="Max queries to run (0 = all)")
+    parser.add_argument("--difficult-only", action="store_true", default=d.difficult_only, help="Only use hard questions (QuALITY only)")
+    parser.add_argument("--no-difficult-only", dest="difficult_only", action="store_false", help="Use all questions, not just hard ones")
+    parser.add_argument("--embedding-model", type=str, default=d.embedding_model_name)
     parser.add_argument(
-        "--embedding-provider", type=str, default="local", choices=["local", "openrouter"],
+        "--embedding-provider", type=str, default=d.embedding_provider, choices=["local", "openrouter"],
         help="Use 'local' for Sentence Transformers or 'openrouter' for API-based embeddings",
     )
-    parser.add_argument("--openrouter-api-key", type=str, default="")
+    parser.add_argument("--openrouter-api-key", type=str, default=d.openrouter_api_key)
     parser.add_argument(
-        "--llm-judge", type=str, default="",
-        help="OpenRouter model for LLM-as-judge evaluation (e.g. anthropic/claude-sonnet-4)",
+        "--retrieval-mode", type=str, default=d.retrieval_mode, choices=["dense", "hybrid"],
+        help="Retrieval mode: 'dense' for embedding-only, 'hybrid' for BM25 + embedding with RRF",
     )
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--llm-judge", type=str, default=d.llm_judge,
+        help="OpenRouter model for LLM-as-judge evaluation (empty string to disable)",
+    )
+    parser.add_argument("--seed", type=int, default=d.random_seed)
     args = parser.parse_args()
 
     return Config(
@@ -59,6 +66,7 @@ def parse_args() -> Config:
         embedding_model_name=args.embedding_model,
         embedding_provider=args.embedding_provider,
         openrouter_api_key=args.openrouter_api_key,
+        retrieval_mode=args.retrieval_mode,
         llm_judge=args.llm_judge,
         random_seed=args.seed,
     )
@@ -108,6 +116,39 @@ def print_hit_rate_table(reports: list[StrategyReport], config: Config) -> None:
     console.print(table)
 
 
+def print_llm_cost_table(reports: list[StrategyReport]) -> None:
+    table = Table(title="LLM Judge Usage", show_lines=True)
+    table.add_column("Strategy", style="bold")
+    table.add_column("Input Tokens", justify="right")
+    table.add_column("Output Tokens", justify="right")
+    table.add_column("Total Cost ($)", justify="right")
+    table.add_column("Total Time (s)", justify="right")
+    table.add_column("Avg Latency (s)", justify="right")
+
+    grand_cost = 0.0
+    for r in reports:
+        usages = [rr.llm_usage for rr in r.retrieval_results if rr.llm_usage]
+        if not usages:
+            continue
+        total_input = sum(u.input_tokens for u in usages)
+        total_output = sum(u.output_tokens for u in usages)
+        total_cost = sum(u.cost for u in usages)
+        total_time = sum(u.latency_s for u in usages)
+        avg_latency = total_time / len(usages)
+        grand_cost += total_cost
+        table.add_row(
+            r.strategy,
+            f"{total_input:,}",
+            f"{total_output:,}",
+            f"${total_cost:.4f}",
+            f"{total_time:.1f}",
+            f"{avg_latency:.2f}",
+        )
+
+    console.print(table)
+    console.print(f"  [bold]Total LLM cost across all strategies: ${grand_cost:.4f}[/bold]")
+
+
 def print_sample_chunks(chunks_by_strategy: dict[str, list]) -> None:
     first_source = None
     for chunks in chunks_by_strategy.values():
@@ -141,6 +182,7 @@ def save_results(config: Config, reports: list[StrategyReport], run_dir: Path) -
             "max_queries": config.max_queries,
             "embedding_model": config.embedding_model_name,
             "embedding_provider": config.embedding_provider,
+            "retrieval_mode": config.retrieval_mode,
             "llm_judge": config.llm_judge,
             "semantic_breakpoint_type": config.semantic_breakpoint_type,
             "random_seed": config.random_seed,
@@ -149,7 +191,7 @@ def save_results(config: Config, reports: list[StrategyReport], run_dir: Path) -
     }
 
     for r in reports:
-        result["strategies"][r.strategy] = {
+        strategy_data = {
             "chunk_stats": {
                 "count": r.chunk_stats.count,
                 "avg_size": round(r.chunk_stats.avg_size, 1),
@@ -164,6 +206,18 @@ def save_results(config: Config, reports: list[StrategyReport], run_dir: Path) -
             "total_queries": len(r.retrieval_results),
             "hits": sum(1 for rr in r.retrieval_results if rr.hit),
         }
+
+        usages = [rr.llm_usage for rr in r.retrieval_results if rr.llm_usage]
+        if usages:
+            strategy_data["llm_usage"] = {
+                "total_input_tokens": sum(u.input_tokens for u in usages),
+                "total_output_tokens": sum(u.output_tokens for u in usages),
+                "total_cost_usd": round(sum(u.cost for u in usages), 4),
+                "total_latency_s": round(sum(u.latency_s for u in usages), 2),
+                "avg_latency_s": round(sum(u.latency_s for u in usages) / len(usages), 2),
+            }
+
+        result["strategies"][r.strategy] = strategy_data
 
     filepath.write_text(json.dumps(result, indent=2))
     return filepath
@@ -197,6 +251,7 @@ def main():
             return
         llm_judge = LLMJudge(config.llm_judge, api_key)
         console.print(f"[bold]LLM judge enabled: {config.llm_judge}[/bold]")
+        console.print(f"  Pricing: ${llm_judge.input_price * 1_000_000:.2f}/M input, ${llm_judge.output_price * 1_000_000:.2f}/M output")
 
     is_mc = any(qa.is_multiple_choice for qa in qa_pairs)
     embedding_helper = None
@@ -206,6 +261,8 @@ def main():
 
     store = VectorStore(config)
     strategies = get_all_strategies(config)
+
+    console.print(f"[bold]Retrieval mode: {config.retrieval_mode}[/bold]")
 
     reports: list[StrategyReport] = []
     chunks_by_strategy: dict[str, list] = {}
@@ -222,27 +279,37 @@ def main():
         collection = store.create_collection(name)
         store.add_chunks(collection, chunks)
 
+        if config.retrieval_mode == "hybrid":
+            retriever = HybridRetriever()
+        else:
+            retriever = DenseRetriever()
+        retriever.build_index(store, collection, chunks)
+
         console.print("  Evaluating retrieval...")
         report = full_report(
-            name, chunks, elapsed, store, collection, qa_pairs, config.top_k,
+            name, chunks, elapsed, retriever, qa_pairs, config.top_k,
             embedding_helper, llm_judge,
         )
         reports.append(report)
         console.print(f"  Hit rate: {report.hit_rate:.1f}%")
 
-        if llm_judge:
-            detail_path = save_detailed_results(name, report.retrieval_results, run_dir)
-            console.print(f"  Detail CSV: [bold]{detail_path}[/bold]")
-
     console.print("\n")
     print_stats_table(reports)
     console.print()
     print_hit_rate_table(reports, config)
+
+    if llm_judge:
+        console.print()
+        print_llm_cost_table(reports)
+
     console.print()
     print_sample_chunks(chunks_by_strategy)
 
     results_path = save_results(config, reports, run_dir)
-    console.print(f"\nResults saved to [bold]{run_dir}/[/bold]")
+    if llm_judge:
+        detail_path = save_detailed_results(reports, run_dir)
+        console.print(f"\nDetail CSV: [bold]{detail_path}[/bold]")
+    console.print(f"Results saved to [bold]{run_dir}/[/bold]")
 
 
 if __name__ == "__main__":
