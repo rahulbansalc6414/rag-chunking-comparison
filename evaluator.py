@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +12,7 @@ import numpy as np
 from openai import OpenAI
 
 from chunkers import Chunk
-from config import Config
+from config import Config, PROMPT_TEMPLATES
 from data_loader import QAPair
 from retriever import Retriever
 from vector_store import VectorStore
@@ -104,8 +106,10 @@ def _fetch_openrouter_pricing(model: str, api_key: str) -> tuple[float, float]:
 
 
 class LLMJudge:
-    def __init__(self, model: str, api_key: str):
+    def __init__(self, model: str, api_key: str, prompt_mode: str = "direct"):
         self.model = model
+        self.prompt_mode = prompt_mode
+        self.templates = PROMPT_TEMPLATES[prompt_mode]
         self.client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=api_key,
@@ -115,30 +119,25 @@ class LLMJudge:
     def answer_question(self, question: str, context: str, options: list[str] | None = None) -> tuple[str, LLMUsage]:
         if options:
             options_text = "\n".join(f"{i+1}. {opt}" for i, opt in enumerate(options))
-            prompt = (
-                f"Based on the following context, answer the multiple-choice question. "
-                f"Reply with ONLY the number of the correct option (1, 2, 3, or 4).\n\n"
-                f"Context:\n{context}\n\n"
-                f"Question: {question}\n\n"
-                f"Options:\n{options_text}\n\n"
-                f"Answer (number only):"
+            prompt = self.templates["mc"].format(
+                context=context, question=question, options=options_text,
             )
         else:
-            prompt = (
-                f"Based on the following context, answer the question in as few words as possible. "
-                f"Reply with ONLY the answer, nothing else.\n\n"
-                f"Context:\n{context}\n\n"
-                f"Question: {question}\n\n"
-                f"Answer:"
+            prompt = self.templates["open"].format(
+                context=context, question=question,
             )
 
+        kwargs = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.templates["max_tokens"],
+            "temperature": 0,
+        }
+        if self.templates.get("json_mode"):
+            kwargs["response_format"] = {"type": "json_object"}
+
         start = time.perf_counter()
-        raw = self.client.chat.completions.with_raw_response.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
-            temperature=0,
-        )
+        raw = self.client.chat.completions.with_raw_response.create(**kwargs)
         latency = time.perf_counter() - start
 
         response = raw.parse()
@@ -147,8 +146,18 @@ class LLMJudge:
         output_tokens = usage.completion_tokens if usage else 0
 
         cost = input_tokens * self.input_price + output_tokens * self.output_price
+        content = response.choices[0].message.content.strip()
 
-        return response.choices[0].message.content.strip(), LLMUsage(
+        if self.templates.get("json_mode"):
+            try:
+                parsed = json.loads(content)
+                answer = str(parsed.get("answer", ""))
+                reasoning = parsed.get("reasoning", "")
+                content = f"{reasoning}\n\n{answer}" if reasoning else answer
+            except json.JSONDecodeError:
+                pass
+
+        return content, LLMUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             latency_s=latency,
@@ -201,15 +210,21 @@ def _check_llm_hit(
     context = "\n\n".join(docs)
     if qa.is_multiple_choice:
         llm_answer, usage = judge.answer_question(qa.question, context, qa.options)
+        numbers = re.findall(r"\b([1-4])\b", llm_answer)
         try:
-            chosen = int(llm_answer.strip().rstrip(".")) - 1
+            chosen = int(numbers[-1]) - 1 if numbers else int(llm_answer.strip().rstrip(".")) - 1
             hit = chosen == qa.gold_label
-        except ValueError:
+        except (ValueError, IndexError):
             hit = False
         return hit, llm_answer, usage
     else:
         llm_answer, usage = judge.answer_question(qa.question, context)
-        hit = qa.answer.lower() in llm_answer.lower() or llm_answer.lower() in qa.answer.lower()
+        last_line = llm_answer.strip().rsplit("\n", 1)[-1].strip()
+        hit = (
+            qa.answer.lower() in last_line.lower()
+            or last_line.lower() in qa.answer.lower()
+            or qa.answer.lower() in llm_answer.lower()
+        )
         return hit, llm_answer, usage
 
 

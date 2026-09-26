@@ -12,7 +12,7 @@ from rich.panel import Panel
 
 from config import Config
 from data_loader import load_dataset_sample, DATASET_REGISTRY
-from chunkers import get_all_strategies, chunk_documents
+from chunkers import get_strategies, chunk_documents
 from vector_store import VectorStore
 from evaluator import (
     full_report, get_embedding_helper, LLMJudge,
@@ -49,6 +49,31 @@ def parse_args() -> Config:
         help="Retrieval mode: 'dense' for embedding-only, 'hybrid' for BM25 + embedding with RRF",
     )
     parser.add_argument(
+        "--prompt-mode", type=str, default=d.prompt_mode, choices=["direct", "cot"],
+        help="Prompt mode: 'direct' for answer-only, 'cot' for chain-of-thought with JSON output",
+    )
+    parser.add_argument(
+        "--questions-file", type=str, default=d.questions_file,
+        help="JSON file with a list of questions to run (only these will be evaluated)",
+    )
+    parser.add_argument(
+        "--strategy", type=str, default=d.strategy,
+        choices=["fixed", "recursive", "semantic", "all"],
+        help="Which chunking strategy to run (default: all)",
+    )
+    parser.add_argument(
+        "--chunk-only", action="store_true", default=d.chunk_only,
+        help="Stop after chunking + embedding + indexing (no retrieval/evaluation)",
+    )
+    parser.add_argument(
+        "--contextual", action="store_true", default=d.contextual,
+        help="Enable contextual retrieval: enrich chunks with document-level context via LLM",
+    )
+    parser.add_argument(
+        "--contextual-model", type=str, default=d.contextual_model,
+        help="Anthropic model for contextual enrichment (requires ANTHROPIC_API_KEY)",
+    )
+    parser.add_argument(
         "--llm-judge", type=str, default=d.llm_judge,
         help="OpenRouter model for LLM-as-judge evaluation (empty string to disable)",
     )
@@ -67,6 +92,12 @@ def parse_args() -> Config:
         embedding_provider=args.embedding_provider,
         openrouter_api_key=args.openrouter_api_key,
         retrieval_mode=args.retrieval_mode,
+        prompt_mode=args.prompt_mode,
+        questions_file=args.questions_file,
+        strategy=args.strategy,
+        chunk_only=args.chunk_only,
+        contextual=args.contextual,
+        contextual_model=args.contextual_model,
         llm_judge=args.llm_judge,
         random_seed=args.seed,
     )
@@ -183,6 +214,10 @@ def save_results(config: Config, reports: list[StrategyReport], run_dir: Path) -
             "embedding_model": config.embedding_model_name,
             "embedding_provider": config.embedding_provider,
             "retrieval_mode": config.retrieval_mode,
+            "prompt_mode": config.prompt_mode,
+            "strategy": config.strategy,
+            "contextual": config.contextual,
+            "contextual_model": config.contextual_model if config.contextual else None,
             "llm_judge": config.llm_judge,
             "semantic_breakpoint_type": config.semantic_breakpoint_type,
             "random_seed": config.random_seed,
@@ -227,7 +262,8 @@ def main():
     config = parse_args()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path("results") / f"{config.dataset}_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if not config.chunk_only:
+        run_dir.mkdir(parents=True, exist_ok=True)
 
     console.print(Panel(f"[bold]RAG Chunking Strategy Comparison — {config.dataset}[/bold]", style="blue"))
 
@@ -239,6 +275,13 @@ def main():
         qa_pairs = [qa for qa in qa_pairs if qa.difficult]
         console.print(f"Filtered to {len(qa_pairs)} hard questions (--difficult-only)")
 
+    if config.questions_file:
+        import json as _json
+        with open(config.questions_file) as _f:
+            allowed = set(q.strip() for q in _json.load(_f))
+        qa_pairs = [qa for qa in qa_pairs if qa.question.strip() in allowed]
+        console.print(f"Filtered to {len(qa_pairs)} questions from {config.questions_file}")
+
     if config.max_queries > 0 and len(qa_pairs) > config.max_queries:
         qa_pairs = qa_pairs[:config.max_queries]
         console.print(f"Capped to {config.max_queries} queries (--max-queries)")
@@ -249,20 +292,28 @@ def main():
         if not api_key:
             console.print("[bold red]Error: --llm-judge requires OPENROUTER_API_KEY[/bold red]")
             return
-        llm_judge = LLMJudge(config.llm_judge, api_key)
+        llm_judge = LLMJudge(config.llm_judge, api_key, config.prompt_mode)
         console.print(f"[bold]LLM judge enabled: {config.llm_judge}[/bold]")
+        console.print(f"  Prompt mode: {config.prompt_mode}")
         console.print(f"  Pricing: ${llm_judge.input_price * 1_000_000:.2f}/M input, ${llm_judge.output_price * 1_000_000:.2f}/M output")
+
+    if config.contextual:
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            console.print("[bold red]Error: --contextual requires ANTHROPIC_API_KEY env var[/bold red]")
+            return
+        console.print(f"[bold]Contextual enrichment enabled: {config.contextual_model}[/bold]")
 
     is_mc = any(qa.is_multiple_choice for qa in qa_pairs)
     embedding_helper = None
-    if is_mc and not llm_judge:
+    if is_mc and not llm_judge and not config.chunk_only:
         console.print("[bold]Multiple-choice dataset detected — loading evaluation model...[/bold]")
         embedding_helper = get_embedding_helper(config)
 
     store = VectorStore(config)
-    strategies = get_all_strategies(config)
+    strategies = get_strategies(config)
 
     console.print(f"[bold]Retrieval mode: {config.retrieval_mode}[/bold]")
+    console.print(f"[bold]Strategy: {config.strategy}[/bold]")
 
     reports: list[StrategyReport] = []
     chunks_by_strategy: dict[str, list] = {}
@@ -270,14 +321,29 @@ def main():
     for name, chunker in strategies.items():
         console.print(f"\n[bold yellow]Processing: {name}[/bold yellow]")
 
-        console.print("  Chunking documents...")
-        chunks, elapsed = chunk_documents(chunker, documents)
-        chunks_by_strategy[name] = chunks
-        console.print(f"  {len(chunks)} chunks in {elapsed:.2f}s")
+        collection, reused = store.get_or_create_collection(name, config.contextual)
+        if reused:
+            console.print(f"  Reusing existing collection ({collection.count()} chunks)")
+            chunks = store.reconstruct_chunks(collection, name)
+            elapsed = 0.0
+        else:
+            console.print("  Chunking documents...")
+            chunks, elapsed = chunk_documents(chunker, documents)
+            console.print(f"  {len(chunks)} chunks in {elapsed:.2f}s")
 
-        console.print("  Creating collection and inserting...")
-        collection = store.create_collection(name)
-        store.add_chunks(collection, chunks)
+            if config.contextual:
+                from contextual import ContextualEnricher
+                enricher = ContextualEnricher(config.contextual_model)
+                chunks = enricher.enrich_chunks(chunks, documents, config)
+
+            console.print("  Inserting into collection...")
+            store.add_chunks(collection, chunks)
+
+        chunks_by_strategy[name] = chunks
+
+        if config.chunk_only:
+            console.print(f"  [green]Indexed {len(chunks)} chunks (--chunk-only, skipping evaluation)[/green]")
+            continue
 
         if config.retrieval_mode == "hybrid":
             retriever = HybridRetriever()
@@ -292,6 +358,12 @@ def main():
         )
         reports.append(report)
         console.print(f"  Hit rate: {report.hit_rate:.1f}%")
+
+    if config.chunk_only:
+        console.print("\n[bold green]Chunk-only mode complete.[/bold green]")
+        for name, chunks in chunks_by_strategy.items():
+            console.print(f"  {name}: {len(chunks)} chunks indexed")
+        return
 
     console.print("\n")
     print_stats_table(reports)

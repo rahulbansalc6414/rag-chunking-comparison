@@ -12,9 +12,21 @@ wheels/
 # ChromaDB data
 chroma_data/
 
+# Contextual retrieval cache (generated API responses)
+contextual_cache/
+
 # Run outputs
 results/
 comparison_chart.png
 
+# Logs
+*.log
+
 # HuggingFace cache
 .cache/
+
+# Plan (private)
+PLAN.md
+
+# macOS
+.DS_Store

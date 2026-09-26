@@ -88,6 +88,23 @@ def get_all_strategies(config: Config) -> dict[str, ChunkerBase]:
     }
 
 
+_STRATEGY_MAP = {
+    "fixed": ("Fixed", FixedChunker),
+    "recursive": ("Recursive", RecursiveChunker),
+    "semantic": ("Semantic", SemanticChunkerWrapper),
+}
+
+
+def get_strategies(config: Config) -> dict[str, ChunkerBase]:
+    if config.strategy == "all":
+        return get_all_strategies(config)
+    key = config.strategy.lower()
+    if key not in _STRATEGY_MAP:
+        raise ValueError(f"Unknown strategy: {config.strategy}. Choose from: {', '.join(_STRATEGY_MAP)}")
+    name, cls = _STRATEGY_MAP[key]
+    return {name: cls(config)}
+
+
 def chunk_documents(chunker: ChunkerBase, documents: list[dict]) -> tuple[list[Chunk], float]:
     start = time.perf_counter()
     all_chunks = []
