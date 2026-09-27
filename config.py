@@ -63,6 +63,8 @@ class Config:
     chunk_only: bool = False
     contextual: bool = False
     contextual_model: str = "claude-haiku-4-5-20251001"
+    rerank: bool = False
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     llm_judge: str = "anthropic/claude-sonnet-4"
     chroma_persist_dir: Path = field(default_factory=lambda: Path("./chroma_data"))
     random_seed: int = 42

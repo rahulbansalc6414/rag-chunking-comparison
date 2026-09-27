@@ -74,6 +74,14 @@ def parse_args() -> Config:
         help="Anthropic model for contextual enrichment (requires ANTHROPIC_API_KEY)",
     )
     parser.add_argument(
+        "--rerank", action="store_true", default=d.rerank,
+        help="Re-rank retrieved chunks using a cross-encoder before evaluation",
+    )
+    parser.add_argument(
+        "--rerank-model", type=str, default=d.rerank_model,
+        help="Cross-encoder model for re-ranking (default: ms-marco-MiniLM-L-6-v2)",
+    )
+    parser.add_argument(
         "--llm-judge", type=str, default=d.llm_judge,
         help="OpenRouter model for LLM-as-judge evaluation (empty string to disable)",
     )
@@ -98,6 +106,8 @@ def parse_args() -> Config:
         chunk_only=args.chunk_only,
         contextual=args.contextual,
         contextual_model=args.contextual_model,
+        rerank=args.rerank,
+        rerank_model=args.rerank_model,
         llm_judge=args.llm_judge,
         random_seed=args.seed,
     )
@@ -180,6 +190,36 @@ def print_llm_cost_table(reports: list[StrategyReport]) -> None:
     console.print(f"  [bold]Total LLM cost across all strategies: ${grand_cost:.4f}[/bold]")
 
 
+def print_latency_table(reports: list[StrategyReport]) -> None:
+    table = Table(title="Query Latency Breakdown (per query avg)", show_lines=True)
+    table.add_column("Strategy", style="bold")
+    table.add_column("Retrieval (ms)", justify="right")
+    table.add_column("Rerank (ms)", justify="right")
+    table.add_column("LLM Judge (ms)", justify="right")
+    table.add_column("Total (ms)", justify="right")
+
+    for r in reports:
+        rrs = r.retrieval_results
+        n = len(rrs)
+        if n == 0:
+            continue
+        avg_retrieval = sum(rr.retrieval_latency_s for rr in rrs) / n * 1000
+        avg_rerank = sum(rr.rerank_latency_s for rr in rrs) / n * 1000
+        avg_llm = 0.0
+        usages = [rr.llm_usage for rr in rrs if rr.llm_usage]
+        if usages:
+            avg_llm = sum(u.latency_s for u in usages) / len(usages) * 1000
+        avg_total = avg_retrieval + avg_rerank + avg_llm
+        table.add_row(
+            r.strategy,
+            f"{avg_retrieval:.0f}",
+            f"{avg_rerank:.0f}" if avg_rerank > 0 else "—",
+            f"{avg_llm:.0f}" if avg_llm > 0 else "—",
+            f"{avg_total:.0f}",
+        )
+    console.print(table)
+
+
 def print_sample_chunks(chunks_by_strategy: dict[str, list]) -> None:
     first_source = None
     for chunks in chunks_by_strategy.values():
@@ -218,6 +258,8 @@ def save_results(config: Config, reports: list[StrategyReport], run_dir: Path) -
             "strategy": config.strategy,
             "contextual": config.contextual,
             "contextual_model": config.contextual_model if config.contextual else None,
+            "rerank": config.rerank,
+            "rerank_model": config.rerank_model if config.rerank else None,
             "llm_judge": config.llm_judge,
             "semantic_breakpoint_type": config.semantic_breakpoint_type,
             "random_seed": config.random_seed,
@@ -241,6 +283,14 @@ def save_results(config: Config, reports: list[StrategyReport], run_dir: Path) -
             "total_queries": len(r.retrieval_results),
             "hits": sum(1 for rr in r.retrieval_results if rr.hit),
         }
+
+        rrs = r.retrieval_results
+        n = len(rrs)
+        if n > 0:
+            strategy_data["latency"] = {
+                "avg_retrieval_ms": round(sum(rr.retrieval_latency_s for rr in rrs) / n * 1000, 1),
+                "avg_rerank_ms": round(sum(rr.rerank_latency_s for rr in rrs) / n * 1000, 1),
+            }
 
         usages = [rr.llm_usage for rr in r.retrieval_results if rr.llm_usage]
         if usages:
@@ -312,6 +362,13 @@ def main():
     store = VectorStore(config)
     strategies = get_strategies(config)
 
+    reranker_instance = None
+    if config.rerank:
+        from reranker import Reranker
+        console.print(f"[bold]Loading re-ranker: {config.rerank_model}[/bold]")
+        reranker_instance = Reranker(config.rerank_model)
+        console.print(f"  Re-ranker loaded (over-retrieve top-{min(config.top_k * 5, 50)}, re-rank to top-{config.top_k})")
+
     console.print(f"[bold]Retrieval mode: {config.retrieval_mode}[/bold]")
     console.print(f"[bold]Strategy: {config.strategy}[/bold]")
 
@@ -354,7 +411,7 @@ def main():
         console.print("  Evaluating retrieval...")
         report = full_report(
             name, chunks, elapsed, retriever, qa_pairs, config.top_k,
-            embedding_helper, llm_judge,
+            embedding_helper, llm_judge, reranker_instance,
         )
         reports.append(report)
         console.print(f"  Hit rate: {report.hit_rate:.1f}%")
@@ -373,6 +430,9 @@ def main():
     if llm_judge:
         console.print()
         print_llm_cost_table(reports)
+
+    console.print()
+    print_latency_table(reports)
 
     console.print()
     print_sample_chunks(chunks_by_strategy)

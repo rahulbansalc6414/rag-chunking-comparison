@@ -48,6 +48,8 @@ class RetrievalResult:
     correct_option: int | None = None
     difficult: bool = False
     llm_usage: LLMUsage | None = None
+    retrieval_latency_s: float = 0.0
+    rerank_latency_s: float = 0.0
 
 
 @dataclass
@@ -234,10 +236,21 @@ def evaluate_retrieval(
     top_k: int,
     embedding_helper: EmbeddingHelper | None = None,
     llm_judge: LLMJudge | None = None,
+    reranker=None,
 ) -> list[RetrievalResult]:
+    fetch_k = min(top_k * 5, 50) if reranker else top_k
     results = []
     for qa in qa_pairs:
-        res = retriever.retrieve(qa.question, top_k)
+        t0 = time.perf_counter()
+        res = retriever.retrieve(qa.question, fetch_k)
+        retrieval_latency = time.perf_counter() - t0
+
+        rerank_latency = 0.0
+        if reranker:
+            t1 = time.perf_counter()
+            res = reranker.rerank(qa.question, res, top_k)
+            rerank_latency = time.perf_counter() - t1
+
         docs = res.documents
         dists = res.distances
 
@@ -261,6 +274,8 @@ def evaluate_retrieval(
                 correct_option=qa.gold_label + 1 if qa.gold_label is not None else None,
                 difficult=qa.difficult,
                 llm_usage=llm_usage,
+                retrieval_latency_s=retrieval_latency,
+                rerank_latency_s=rerank_latency,
             )
         )
     return results
@@ -279,7 +294,8 @@ def save_detailed_results(
         writer = csv.writer(f)
         header = ["question", "expected_answer", "correct_option", "difficulty"]
         for s in strategies:
-            header += [f"{s}_answer", f"{s}_match", f"{s}_dist", f"{s}_cost"]
+            header += [f"{s}_answer", f"{s}_match", f"{s}_dist", f"{s}_cost",
+                       f"{s}_retrieval_ms", f"{s}_rerank_ms", f"{s}_llm_ms", f"{s}_total_ms"]
         writer.writerow(header)
 
         for i in range(num_questions):
@@ -293,11 +309,17 @@ def save_detailed_results(
             for s in strategies:
                 r = results_by_strategy[s][i]
                 u = r.llm_usage
+                llm_ms = u.latency_s * 1000 if u else 0.0
+                total_ms = r.retrieval_latency_s * 1000 + r.rerank_latency_s * 1000 + llm_ms
                 row += [
                     r.llm_answer,
                     "YES" if r.hit else "NO",
                     f"{r.distances[0]:.4f}" if r.distances else "",
                     f"{u.cost:.6f}" if u else "",
+                    f"{r.retrieval_latency_s * 1000:.1f}",
+                    f"{r.rerank_latency_s * 1000:.1f}",
+                    f"{llm_ms:.1f}",
+                    f"{total_ms:.1f}",
                 ]
             writer.writerow(row)
     return filepath
@@ -312,9 +334,10 @@ def full_report(
     top_k: int,
     embedding_helper: EmbeddingHelper | None = None,
     llm_judge: LLMJudge | None = None,
+    reranker=None,
 ) -> StrategyReport:
     stats = compute_chunk_stats(chunks, elapsed)
-    retrieval = evaluate_retrieval(retriever, qa_pairs, top_k, embedding_helper, llm_judge)
+    retrieval = evaluate_retrieval(retriever, qa_pairs, top_k, embedding_helper, llm_judge, reranker)
 
     hits = sum(1 for r in retrieval if r.hit)
     hit_rate = hits / len(retrieval) * 100 if retrieval else 0.0

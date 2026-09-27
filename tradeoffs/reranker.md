@@ -81,10 +81,23 @@ A re-ranker sits between retrieval and the LLM. Instead of passing the top-K res
 - **Low risk if self-hosted**: Cross-encoder models are open-source (HuggingFace). Switching models is a config change.
 - **Medium risk if API-based**: Cohere and Jina have different APIs. Switching requires code changes, but the interface is simple (list of texts in, scores out).
 
+## Model Landscape (as of September 2026)
+
+| Model | Type | Size | MTEB Reranking Score | Key Trait |
+|-------|------|------|---------------------|-----------|
+| Querit-Reranker-4B | Open, 4B params | ~8GB | **71.08** (#1 MTEB) | Best accuracy, large |
+| BAAI/bge-reranker-v2-m3 | Open, local | ~2.3GB (568M params) | Top-tier | Best open-source accuracy, 8K context, multilingual |
+| Cohere Rerank 4 | Hosted API | N/A | Top-tier | Lowest-friction managed option |
+| cross-encoder/ms-marco-MiniLM-L-6-v2 | Open, local | ~80MB | Good | Best speed/accuracy tradeoff, 512 token limit |
+| ColBERTv2 | Open, local | ~500MB | Good | Token-level interaction, late-interaction architecture |
+
+Sources: [MTEB Leaderboard](https://www.codesota.com/benchmarks/mteb), [Querit-Reranker paper](https://arxiv.org/pdf/2606.19037), [Best Rerankers for RAG 2026](https://futureagi.com/blog/best-rerankers-for-rag-2026/), [HuggingFace bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)
+
 ## Recommendation
 
 Add a re-ranker as the **lowest-risk, highest-ROI improvement** to the current pipeline:
-- Start with Cohere Rerank API for fast validation.
-- Move to a self-hosted cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2` or similar) before enterprise deployment.
+- Start with `BAAI/bge-reranker-v2-m3` — best open-source accuracy, runs locally, no API key needed, 8K context handles contextually-enriched chunks.
+- If too slow or too large, fall back to `cross-encoder/ms-marco-MiniLM-L-6-v2` (~80MB, near-instant, but 512-token limit may truncate contextual chunks).
 - Over-retrieve top-50 with hybrid search, re-rank to top-5 for the LLM.
 - Add a bypass fallback: if re-ranker is unavailable, fall back to raw hybrid scores.
+- Reserve Cohere Rerank API for cases where self-hosted accuracy isn't sufficient.
