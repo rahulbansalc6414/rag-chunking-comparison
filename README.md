@@ -161,7 +161,7 @@ Key findings:
 - **Chain-of-thought helps large chunks only**: CoT improves Semantic but hurts Fixed, even with contextual enrichment
 - **Recursive chunking is not competitive** for reasoning-heavy questions
 
-See `learnings/master_learnings.md` for detailed analysis and `master_results.csv` for per-question results.
+See `docs/learnings/master_learnings.md` for detailed analysis and `master_results.csv` for per-question results.
 
 ## Project Structure
 
@@ -178,9 +178,8 @@ See `learnings/master_learnings.md` for detailed analysis and `master_results.cs
 ├── contextual_cache/  # Cached contextual prefixes (auto-generated)
 ├── chroma_data/       # Persisted ChromaDB collections
 ├── results/           # Timestamped output from each run
-├── tradeoffs/         # Tradeoff analysis docs for architectural decisions
-├── PLAN.md            # Roadmap for enterprise knowledge system
-└── QA.md              # Technical Q&A
+├── docs/              # Learnings, tradeoffs, summaries, Q&A, session logs
+└── PLAN.md            # Roadmap (gitignored)
 ```
 
 ## License
